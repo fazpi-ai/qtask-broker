@@ -4,7 +4,8 @@ from typing import List, Dict, Any
 
 # Web framework and data validation
 from fastapi import FastAPI, HTTPException, Body, status
-from pydantic import BaseModel, Field # Field for extra validation
+from pydantic import BaseModel, Field
+from datetime import datetime
 
 # Import our business logic classes
 from qtask_broker.config import ConfigurationLoader
@@ -89,6 +90,9 @@ app = FastAPI(
     lifespan=lifespan # Register the lifespan handler
 )
 
+class HealthResponse(BaseModel):
+    server_time: str
+
 # --- Data Models (Pydantic) for Request Validation ---
 # Field descriptions updated to English
 
@@ -126,6 +130,15 @@ class TopicsResponse(BaseModel):
 
 
 # --- API Endpoints ---
+@app.get(
+    "/",
+    response_model=HealthResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get server current time",
+    tags=["Health"]
+)
+async def get_():
+    return HealthResponse(server_time=datetime.utcnow().isoformat() + "Z")
 
 @app.post(
     "/assign-partition",
