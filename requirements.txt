@@ -1,0 +1,6 @@
+dotenv
+python-dotenv
+redis
+fastapi
+uvicorn
+pydantic
