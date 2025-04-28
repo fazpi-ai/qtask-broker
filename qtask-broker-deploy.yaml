@@ -1,26 +1,25 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: qtask-broker-deployment # Nombre del Deployment
+  name: qtask-broker-deployment
   labels:
-    app: qtask-broker           # Etiqueta para identificar los recursos
+    app: qtask-broker
 spec:
-  replicas: 1                  # Número de Pods a ejecutar (según solicitado)
+  replicas: 1
   selector:
     matchLabels:
-      app: qtask-broker         # Selecciona Pods con esta etiqueta
+      app: qtask-broker
   template:
     metadata:
       labels:
-        app: qtask-broker       # Etiqueta que se aplicará a los Pods
+        app: qtask-broker
     spec:
       containers:
-      - name: qtask-broker-container # Nombre del contenedor dentro del Pod
-        image: cloudcitycolombia/qtask-broker:latest # Imagen a usar (privada)
+      - name: qtask-broker-container
+        image: cloudcitycolombia/qtask-broker:latest
         ports:
-        - containerPort: 3000     # Puerto que expone el contenedor (de la variable PORT)
+        - containerPort: 3000
         env:
-        # Variables de entorno para la aplicación (según solicitado)
         - name: PORT
           value: "3000"
         - name: REDIS_HOST
@@ -33,31 +32,33 @@ spec:
           value: "3n7F8fqEFfzC2vfCaeztlXNKxtcIJjxX2Mht+GadPmyGdXbrI36CHw=="
         - name: NUM_PARTITIONS
           value: "1"
-         resources:
-           requests:
-             memory: "64Mi"
-             cpu: "100m" # 0.1 CPU cores
-           limits:
-             memory: "128Mi"
-             cpu: "500m" # 0.5 CPU cores
+        - name: UVICORN_WORKERS
+          value: "1"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
       imagePullSecrets:
-      - name: dockerhub-secret      # Nombre del secreto para jalar la imagen privada
+      - name: dockerhub-secret
 
 ---
 
 apiVersion: v1
 kind: Service
 metadata:
-  name: qtask-broker-service    # Nombre del Service
+  name: qtask-broker-service
   labels:
-    app: qtask-broker           # Etiqueta (opcional pero útil)
+    app: qtask-broker
 spec:
-  type: NodePort                # Tipo de servicio: NodePort (según solicitado)
+  type: NodePort
   selector:
-    app: qtask-broker           # Selecciona los Pods con esta etiqueta para dirigir el tráfico
+    app: qtask-broker
   ports:
-  - name: http                  # Nombre descriptivo para el puerto
+  - name: http
     protocol: TCP
-    port: 3000                  # Puerto expuesto por el Service DENTRO del cluster
-    targetPort: 3000            # Puerto al que apunta en los Pods (containerPort)
-    nodePort: 30001             # Puerto estático expuesto en CADA nodo del cluster (según solicitado) 
+    port: 3000
+    targetPort: 3000
+    nodePort: 30001
