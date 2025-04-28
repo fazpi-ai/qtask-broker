@@ -7,13 +7,13 @@ from fastapi import FastAPI, HTTPException, Body, status
 from pydantic import BaseModel, Field # Field for extra validation
 
 # Import our business logic classes
-from config import ConfigurationLoader
-from redis_manager import RedisManager
-from partition_manager import PartitionManager
-from assignment_service import AssignmentService
-from subscription_service import SubscriptionService
-from publishing_service import PublishingService
-from topic_service import TopicService
+from qtask_broker.config import ConfigurationLoader
+from qtask_broker.redis_manager import RedisManager
+from qtask_broker.partition_manager import PartitionManager
+from qtask_broker.assignment_service import AssignmentService
+from qtask_broker.subscription_service import SubscriptionService
+from qtask_broker.publishing_service import PublishingService
+from qtask_broker.topic_service import TopicService
 
 # --- Logging Configuration ---
 # Configure once at the application's entry point

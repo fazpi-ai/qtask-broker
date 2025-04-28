@@ -2,7 +2,7 @@ import redis
 import logging
 import time
 # Import the configuration class we created
-from config import ConfigurationLoader
+from qtask_broker.config import ConfigurationLoader
 
 # Configure logger for this module
 # It's better to configure logging once in your application's main entry point.

@@ -1,9 +1,9 @@
 import logging
 # Import necessary dependencies
-from redis_manager import RedisManager
-from partition_manager import PartitionManager
+from qtask_broker.redis_manager import RedisManager
+from qtask_broker.partition_manager import PartitionManager
 # Import ConfigurationLoader for type hinting if needed, although not used directly
-from config import ConfigurationLoader
+from qtask_broker.config import ConfigurationLoader
 
 logger = logging.getLogger(__name__)
 

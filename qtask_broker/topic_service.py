@@ -2,12 +2,12 @@ import logging
 from typing import List, Set, Optional # For more specific type hints
 
 # Import necessary dependencies
-from redis_manager import RedisManager
+from qtask_broker.redis_manager import RedisManager
 # Import the constant from SubscriptionService or define it here
 # Assuming subscription_service.py also exists
-from subscription_service import SubscriptionService
+from qtask_broker.subscription_service import SubscriptionService
 # Import ConfigurationLoader for type hinting if needed
-from config import ConfigurationLoader
+from qtask_broker.config import ConfigurationLoader
 
 
 logger = logging.getLogger(__name__)

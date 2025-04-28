@@ -1,7 +1,7 @@
 import hashlib
 import logging
 # Import the configuration class
-from config import ConfigurationLoader
+from qtask_broker.config import ConfigurationLoader
 
 logger = logging.getLogger(__name__)
 

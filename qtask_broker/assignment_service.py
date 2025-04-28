@@ -1,7 +1,7 @@
 import logging
 # Import necessary dependencies
-from redis_manager import RedisManager
-from config import ConfigurationLoader # Needed indirectly via RedisManager
+from qtask_broker.redis_manager import RedisManager
+from qtask_broker.config import ConfigurationLoader # Needed indirectly via RedisManager
 
 logger = logging.getLogger(__name__)
 
