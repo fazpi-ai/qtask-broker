@@ -1,17 +1,25 @@
-import redis
+# qtask_broker/redis_manager.py
+import redis.asyncio as redis_async # Renombrar alias para claridad
 import logging
+import asyncio
 import time
-# Import the configuration class we created
+
+# --- CORRECCIÓN: Importar excepciones desde el paquete 'redis' base ---
+from redis.exceptions import (
+    ConnectionError as RedisConnectionError, # Usar alias si ConnectionError choca con built-in
+    TimeoutError as RedisTimeoutError,       # Usar alias si TimeoutError choca con asyncio.TimeoutError
+    ResponseError as RedisResponseError,
+    NoScriptError as RedisNoScriptError,
+    AuthenticationError as RedisAuthenticationError,
+    RedisError # Clase base por si acaso
+)
+
+# Importar ConfigurationLoader (sin cambios)
 from qtask_broker.config import ConfigurationLoader
 
-# Configure logger for this module
-# It's better to configure logging once in your application's main entry point.
-# If you already do it there, you can comment out or remove the following line.
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- The Lua Assignment Script ---
-# Defined as a constant for clarity
+# --- Script Lua (sin cambios) ---
 ASSIGN_PARTITION_LUA_SCRIPT = """
   local assignmentsKey = KEYS[1]
   local requestingConsumerId = ARGV[1]
@@ -114,326 +122,325 @@ ASSIGN_PARTITION_LUA_SCRIPT = """
 
   redis.log(redis.LOG_WARNING, "Lua Script End: No partition assigned or available. Returning -1")
   return -1 -- No partitions available
-"""
+""" # cite: 6
 
 class RedisManager:
     """
-    Manages the connection to Redis and encapsulates necessary operations
-    for the broker, including Lua script execution.
+    Manages the ASYNCHRONOUS connection to Redis and encapsulates necessary operations
+    for the broker, including Lua script execution. (Corrected Exception Handling)
     """
     def __init__(self, config: ConfigurationLoader):
-        """
-        Initializes the RedisManager.
-
-        Args:
-            config: A ConfigurationLoader instance with the loaded configuration.
-        """
         self.config = config
-        self.redis_client: redis.Redis | None = None
+        # Usar el alias renombrado para el cliente async
+        self.redis_client: redis_async.Redis | None = None
         self._lua_script_sha: str | None = None
-        self._connect_retry_interval = 5 # Seconds between connection retries
+        self._connect_retry_interval = 5
+        self._connect_max_retries = 5
+        self._connect_timeout = 10
+        self._socket_timeout = 10
 
-        # Build connection URL (handles optional user/pass)
+        # Construir URL (sin cambios)
         redis_url = f"redis://{config.redis_host}:{config.redis_port}"
         if config.redis_username and config.redis_password:
              redis_url = f"redis://{config.redis_username}:{config.redis_password}@{config.redis_host}:{config.redis_port}"
-        elif config.redis_username: # Only username, no password
+        elif config.redis_username:
              redis_url = f"redis://{config.redis_username}@{config.redis_host}:{config.redis_port}"
 
-        logger.info(f"Preparing Redis connection with base URL: redis://...@{config.redis_host}:{config.redis_port}")
+        logger.info(f"Preparing ASYNC Redis connection with base URL: redis://...@{config.redis_host}:{config.redis_port}")
         self._redis_url = redis_url
 
-    def _ensure_connection(self):
-        """Ensures the Redis connection is active, retrying if necessary."""
-        # If already connected and ping works, do nothing more
-        try:
-            if self.redis_client and self.redis_client.ping():
-                return True
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
-             logger.warning("Redis ping failed, attempting reconnect...")
-             self.redis_client = None # Force reconnection
-        except Exception as e:
-             logger.error(f"Unexpected error during Redis ping: {e}")
-             self.redis_client = None # Force reconnection
+    async def _ensure_connection(self, retries_left=None):
+        """Ensures the Redis connection is active, retrying if necessary. ASYNCHRONOUS."""
+        if retries_left is None:
+            retries_left = self._connect_max_retries
 
-
-        logger.info(f"Attempting to connect to Redis at {self._redis_url}...")
-        while True:
-            try:
-                # decode_responses=True is crucial for working with strings
-                self.redis_client = redis.from_url(self._redis_url, decode_responses=True)
-                self.redis_client.ping() # Verify connection immediately
-                logger.info("Successfully connected to Redis.")
-                # Try loading the Lua script after connecting
-                self._load_lua_script()
-                return True # Exit the while loop if everything succeeded
-
-            # --- CORRECTED ORDER ---
-            except redis.exceptions.AuthenticationError as e: # Catch specific error FIRST
-                 logger.error(f"Authentication error with Redis: {e}. Check REDIS_USERNAME/REDIS_PASSWORD.")
-                 logger.error("Will not retry connection due to authentication error.")
-                 self.redis_client = None # Ensure client is None
-                 return False # Exit loop and method indicating failure
-            except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e: # Catch general error LATER
-                logger.error(f"Failed to connect to Redis: {e}. Retrying in {self._connect_retry_interval}s...")
-                self.redis_client = None # Reset client on failure
-                time.sleep(self._connect_retry_interval) # Wait before retrying
-            # --- END CORRECTED ORDER ---
-            except Exception as e: # Catch any other unexpected errors
-                logger.error(f"Unexpected error during connection: {e}")
-                self.redis_client = None
-                time.sleep(self._connect_retry_interval) # Wait before retrying
-
-
-    def _load_lua_script(self):
-        """Loads the Lua script into Redis and stores its SHA1 hash."""
-        if not self.redis_client:
-            logger.warning("Cannot load Lua script, Redis client not connected.")
-            return
-
-        logger.info("Loading Lua script into Redis...")
-        try:
-            # SCRIPT LOAD returns the SHA1 hash of the script
-            self._lua_script_sha = self.redis_client.script_load(ASSIGN_PARTITION_LUA_SCRIPT)
-            logger.info(f"Lua script loaded successfully. SHA1: {self._lua_script_sha}")
-        except redis.exceptions.ResponseError as e:
-            logger.error(f"Error loading Lua script into Redis: {e}")
-            self._lua_script_sha = None
-        except Exception as e: # Catch other potential errors (e.g., ConnectionError if connection drops here)
-            logger.error(f"Unexpected error loading Lua script: {e}")
-            self._lua_script_sha = None
-
-    def execute_assignment_script(self, assignments_key: str, consumer_id: str, num_partitions: int) -> int:
-        """
-        Executes the partition assignment Lua script.
-
-        Args:
-            assignments_key: The hash key where assignments are stored.
-            consumer_id: The ID of the consumer requesting the partition.
-            num_partitions: The total number of configured partitions.
-
-        Returns:
-            The assigned partition index (>= 0) or -1 if assignment failed
-            or an error occurred.
-        """
-        if not self._ensure_connection() or not self.redis_client:
-             logger.error("Cannot execute Lua script, Redis connection unavailable.")
-             return -1 # Indicate failure due to connection
-
-        if not self._lua_script_sha:
-            logger.warning("Lua script SHA1 hash unavailable. Attempting to load again...")
-            # Don't call _ensure_connection again here, it was already done. Just load script.
-            self._load_lua_script()
-            if not self._lua_script_sha:
-                 logger.error("Could not load Lua script after retry. Cannot execute EVALSHA.")
-                 return -1 # Indicate failure due to script not loaded
-
-        keys = [assignments_key]
-        args = [
-            consumer_id,
-            str(num_partitions), # Lua expects strings for ARGV
-            self.config.heartbeat_key_prefix
-        ]
-
-        try:
-            logger.debug(f"Executing EVALSHA {self._lua_script_sha} with KEYS={keys} ARGV={args}")
-            # Try executing using the SHA1 hash
-            result = self.redis_client.evalsha(self._lua_script_sha, len(keys), *keys, *args)
-            logger.debug(f"EVALSHA result: {result} (Type: {type(result)})")
-            # Lua script returns a number (or nil, which redis-py might convert to None)
-            # Ensure None case is handled before int conversion
-            return int(result) if result is not None else -1
-
-        except redis.exceptions.NoScriptError:
-            logger.warning("NOSCRIPT error, script not in Redis cache. Attempting EVAL...")
-            # The script wasn't cached (maybe Redis restarted), use EVAL once
-            # Redis will cache it automatically on success.
-            try:
-                result = self.redis_client.eval(ASSIGN_PARTITION_LUA_SCRIPT, len(keys), *keys, *args)
-                logger.info("EVAL executed successfully after NOSCRIPT.")
-                # Try reloading the SHA just in case
-                self._load_lua_script()
-                return int(result) if result is not None else -1
-            except Exception as eval_err:
-                logger.error(f"Error executing EVAL after NOSCRIPT: {eval_err}")
-                return -1 # Failed even with EVAL
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
-             logger.error(f"Connection/Timeout error executing Lua script: {e}. Will attempt reconnect on next call.")
-             self.redis_client = None # Force reconnect on next call
-             return -1
-        except Exception as e:
-            logger.error(f"Unexpected error executing Lua script: {e}")
-            return -1 # Other error type
-
-    # --- Wrapper methods for other Redis commands ---
-    # (Ensure they all call _ensure_connection() first)
-
-    def xadd(self, stream_key: str, data: dict) -> str | None:
-        """Adds a message to a stream."""
-        if not self._ensure_connection() or not self.redis_client: return None
-        try:
-            # '*' lets Redis generate the message ID
-            message_id = self.redis_client.xadd(stream_key, data)
-            logger.debug(f"XADD on {stream_key}: ID={message_id}, Data={data}")
-            return message_id
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
-             logger.error(f"Connection/Timeout error on XADD for stream {stream_key}: {e}. Will attempt reconnect.")
-             self.redis_client = None # Force reconnect
-             return None
-        except Exception as e:
-            logger.error(f"Unexpected error on XADD for stream {stream_key}: {e}")
-            return None
-
-    def xgroup_create(self, stream_key: str, group_name: str, start_id: str = '$', mkstream: bool = False) -> bool:
-        """Creates a consumer group for a stream."""
-        if not self._ensure_connection() or not self.redis_client: return False
-        try:
-            self.redis_client.xgroup_create(stream_key, group_name, id=start_id, mkstream=mkstream)
-            logger.info(f"XGROUP CREATE successful for group '{group_name}' on stream '{stream_key}'.")
-            return True
-        except redis.exceptions.ResponseError as e:
-            # It's normal for the group to already exist, not a fatal error.
-            if "BUSYGROUP" in str(e):
-                logger.warning(f"Group '{group_name}' already exists on stream '{stream_key}'.")
-                return True # Consider success if it already exists
-            else:
-                logger.error(f"Error (ResponseError) on XGROUP CREATE for {group_name} on {stream_key}: {e}")
-                return False
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
-             logger.error(f"Connection/Timeout error on XGROUP CREATE for {group_name} on {stream_key}: {e}. Will attempt reconnect.")
-             self.redis_client = None # Force reconnect
-             return False
-        except Exception as e:
-            logger.error(f"Unexpected error on XGROUP CREATE for {group_name} on {stream_key}: {e}")
-            return False
-
-    def sadd(self, set_key: str, member: str) -> int | None:
-        """Adds a member to a set."""
-        if not self._ensure_connection() or not self.redis_client: return None
-        try:
-            result = self.redis_client.sadd(set_key, member)
-            logger.debug(f"SADD on {set_key}: Member={member}, Result={result}")
-            return result # 1 if added, 0 if already existed
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
-             logger.error(f"Connection/Timeout error on SADD for set {set_key}: {e}. Will attempt reconnect.")
-             self.redis_client = None # Force reconnect
-             return None
-        except Exception as e:
-            logger.error(f"Unexpected error on SADD for set {set_key}: {e}")
-            return None
-
-    def smembers(self, set_key: str) -> set[str] | None:
-        """Gets all members of a set."""
-        if not self._ensure_connection() or not self.redis_client: return None
-        try:
-            members = self.redis_client.smembers(set_key)
-            logger.debug(f"SMEMBERS on {set_key}: Found={len(members)}")
-            return members
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
-             logger.error(f"Connection/Timeout error on SMEMBERS for set {set_key}: {e}. Will attempt reconnect.")
-             self.redis_client = None # Force reconnect
-             return None
-        except Exception as e:
-            logger.error(f"Unexpected error on SMEMBERS for set {set_key}: {e}")
-            return None
-
-    def close_connection(self):
-        """Closes the Redis connection if it's open."""
         if self.redis_client:
             try:
-                self.redis_client.close()
-                logger.info("Redis connection closed.")
+                 if await asyncio.wait_for(self.redis_client.ping(), timeout=self._socket_timeout):
+                      return True
+            # --- CORRECCIÓN: Usar excepciones importadas ---
+            except RedisConnectionError:
+                 logger.warning("Async Redis ping failed (ConnectionError), attempting reconnect...")
+                 await self.close_connection()
+            except RedisTimeoutError: # Timeout desde redis-py
+                 logger.warning("Async Redis ping failed (TimeoutError from redis-py), attempting reconnect...")
+                 await self.close_connection()
+            except asyncio.TimeoutError: # Timeout del asyncio.wait_for
+                 logger.warning("Async Redis ping timed out locally (asyncio.TimeoutError), attempting reconnect...")
+                 await self.close_connection()
+            except RedisAuthenticationError: # Posible si las credenciales cambian
+                 logger.error("Authentication error during async Redis ping. Check credentials.")
+                 await self.close_connection()
+                 return False # No reintentar en auth error
             except Exception as e:
-                # Log error, but ensure client is set to None regardless
-                logger.error(f"Error closing Redis connection: {e}")
-            finally:
-                 self.redis_client = None # Ensure client is marked as closed
+                 logger.error(f"Unexpected error during async Redis ping: {e}", exc_info=True)
+                 await self.close_connection()
 
-# --- Example Usage (Could be in your main application file) ---
-# (The if __name__ == "__main__" block remains the same as before)
-if __name__ == "__main__":
-    # Configure basic logging if not already configured
+        if retries_left <= 0:
+             logger.error("Max connection retries reached. Could not connect to Redis.")
+             return False
+
+        logger.info(f"Attempting to connect ASYNCHRONOUSLY to Redis at {self._redis_url}... ({retries_left} retries left)")
+        try:
+            # Usar el alias renombrado aquí también
+            self.redis_client = redis_async.from_url(
+                self._redis_url,
+                decode_responses=True,
+                socket_connect_timeout=self._connect_timeout,
+                socket_timeout=self._socket_timeout
+            )
+            if not await asyncio.wait_for(self.redis_client.ping(), timeout=self._connect_timeout):
+                 raise RedisConnectionError("Ping returned False after connection")
+
+            logger.info("Successfully connected ASYNCHRONOUSLY to Redis.")
+            await self._load_lua_script()
+            return True
+
+        # --- CORRECCIÓN: Usar excepciones importadas ---
+        except RedisAuthenticationError as e:
+             logger.error(f"Authentication error with Redis: {e}. Check REDIS_USERNAME/REDIS_PASSWORD.")
+             logger.error("Will not retry connection due to authentication error.")
+             await self.close_connection()
+             return False
+        except (RedisConnectionError, RedisTimeoutError, asyncio.TimeoutError) as e:
+            logger.error(f"Failed to connect to Redis: {e}. Retrying in {self._connect_retry_interval}s...")
+            await self.close_connection()
+            await asyncio.sleep(self._connect_retry_interval)
+            return await self._ensure_connection(retries_left - 1)
+        except Exception as e:
+            logger.error(f"Unexpected error during async connection: {e}", exc_info=True)
+            await self.close_connection()
+            await asyncio.sleep(self._connect_retry_interval)
+            return await self._ensure_connection(retries_left - 1)
+
+    async def _load_lua_script(self):
+        """Loads the Lua script into Redis ASYNCHRONOUSLY."""
+        if not self.redis_client:
+            logger.warning("Cannot load Lua script, async Redis client not connected.")
+            return
+
+        logger.info("Loading/Reloading Lua script into Redis ASYNCHRONOUSLY...")
+        try:
+            self._lua_script_sha = await self.redis_client.script_load(ASSIGN_PARTITION_LUA_SCRIPT)
+            logger.info(f"Lua script loaded successfully (async). SHA1: {self._lua_script_sha}")
+        # --- CORRECCIÓN: Usar excepciones importadas ---
+        except RedisResponseError as e:
+            logger.error(f"Error loading Lua script into Redis (async): {e}")
+            self._lua_script_sha = None
+        except (RedisConnectionError, RedisTimeoutError, asyncio.TimeoutError) as e:
+             logger.error(f"Connection/Timeout error loading Lua script (async): {e}")
+             self._lua_script_sha = None
+             await self.close_connection()
+        except Exception as e:
+            logger.error(f"Unexpected error loading Lua script (async): {e}", exc_info=True)
+            self._lua_script_sha = None
+
+    async def execute_assignment_script(self, assignments_key: str, consumer_id: str, num_partitions: int) -> int:
+        """Executes the partition assignment Lua script ASYNCHRONOUSLY."""
+        if not await self._ensure_connection() or not self.redis_client:
+             logger.error("Cannot execute Lua script (async), Redis connection unavailable.")
+             return -1
+
+        if not self._lua_script_sha:
+            logger.warning("Lua script SHA1 hash unavailable (async). Attempting to load again...")
+            await self._load_lua_script()
+            if not self._lua_script_sha:
+                 logger.error("Could not load Lua script after retry (async). Cannot execute.")
+                 return -1
+
+        keys = [assignments_key]
+        args = [consumer_id, str(num_partitions), self.config.heartbeat_key_prefix]
+
+        try:
+            logger.debug(f"Executing EVALSHA (async) {self._lua_script_sha} with KEYS={keys} ARGV={args}")
+            result = await self.redis_client.evalsha(self._lua_script_sha, len(keys), *keys, *args)
+            logger.debug(f"EVALSHA result (async): {result}")
+            return int(result) if result is not None else -1
+        # --- CORRECCIÓN: Usar excepciones importadas ---
+        except RedisNoScriptError:
+            logger.warning("NOSCRIPT error (async), script not in Redis cache. Attempting EVAL...")
+            try:
+                result = await self.redis_client.eval(ASSIGN_PARTITION_LUA_SCRIPT, len(keys), *keys, *args)
+                logger.info("EVAL executed successfully after NOSCRIPT (async). Redis will cache it now.")
+                # await self._load_lua_script() # Opcional
+                return int(result) if result is not None else -1
+            except Exception as eval_err:
+                logger.error(f"Error executing EVAL after NOSCRIPT (async): {eval_err}", exc_info=True)
+                return -1
+        # --- CORRECCIÓN: Usar excepciones importadas ---
+        except (RedisConnectionError, RedisTimeoutError, asyncio.TimeoutError) as e:
+             logger.error(f"Connection/Timeout error executing Lua script (async): {e}. Will attempt reconnect on next call.")
+             await self.close_connection()
+             return -1
+        except Exception as e:
+            logger.error(f"Unexpected error executing Lua script (async): {e}", exc_info=True)
+            return -1
+
+    # --- Wrappers para otros comandos Redis (corregidos) ---
+
+    async def xadd(self, stream_key: str, data: dict) -> str | None:
+        """Adds a message to a stream ASYNCHRONOUSLY."""
+        if not await self._ensure_connection() or not self.redis_client: return None
+        try:
+            message_id = await self.redis_client.xadd(stream_key, data)
+            logger.debug(f"XADD (async) on {stream_key}: ID={message_id}")
+            return message_id
+        # --- CORRECCIÓN: Usar excepciones importadas ---
+        except (RedisConnectionError, RedisTimeoutError, asyncio.TimeoutError) as e:
+             logger.error(f"Connection/Timeout error on XADD (async) for {stream_key}: {e}. Will attempt reconnect.")
+             await self.close_connection()
+             return None
+        except Exception as e:
+            logger.error(f"Unexpected error on XADD (async) for {stream_key}: {e}", exc_info=True)
+            return None
+
+    async def xgroup_create(self, stream_key: str, group_name: str, start_id: str = '$', mkstream: bool = False) -> bool:
+        """Creates a consumer group for a stream ASYNCHRONOUSLY."""
+        if not await self._ensure_connection() or not self.redis_client: return False
+        try:
+            await self.redis_client.xgroup_create(stream_key, group_name, id=start_id, mkstream=mkstream)
+            logger.info(f"XGROUP CREATE (async) successful for group '{group_name}' on stream '{stream_key}'.")
+            return True
+        # --- CORRECCIÓN: Usar excepción importada ---
+        except RedisResponseError as e: # <--- AQUÍ ESTABA EL ERROR
+            if "BUSYGROUP Consumer Group name already exists" in str(e):
+                logger.info(f"Group '{group_name}' already exists (async) on stream '{stream_key}'. Considered success.")
+                return True
+            else:
+                logger.error(f"Error (ResponseError) on XGROUP CREATE (async) for {group_name} on {stream_key}: {e}")
+                return False
+        # --- CORRECCIÓN: Usar excepciones importadas ---
+        except (RedisConnectionError, RedisTimeoutError, asyncio.TimeoutError) as e:
+             logger.error(f"Connection/Timeout error on XGROUP CREATE (async) for {group_name} on {stream_key}: {e}. Will attempt reconnect.")
+             await self.close_connection()
+             return False
+        except Exception as e:
+            logger.error(f"Unexpected error on XGROUP CREATE (async) for {group_name} on {stream_key}: {e}", exc_info=True)
+            return False
+
+    async def sadd(self, set_key: str, member: str) -> int | None:
+        """Adds a member to a set ASYNCHRONOUSLY."""
+        if not await self._ensure_connection() or not self.redis_client: return None
+        try:
+            result = await self.redis_client.sadd(set_key, member)
+            logger.debug(f"SADD (async) on {set_key}: Member={member}, Result={result}")
+            return result
+        # --- CORRECCIÓN: Usar excepciones importadas ---
+        except (RedisConnectionError, RedisTimeoutError, asyncio.TimeoutError) as e:
+             logger.error(f"Connection/Timeout error on SADD (async) for {set_key}: {e}. Will attempt reconnect.")
+             await self.close_connection()
+             return None
+        except Exception as e:
+            logger.error(f"Unexpected error on SADD (async) for {set_key}: {e}", exc_info=True)
+            return None
+
+    async def smembers(self, set_key: str) -> set[str] | None:
+        """Gets all members of a set ASYNCHRONOUSLY."""
+        if not await self._ensure_connection() or not self.redis_client: return None
+        try:
+            members = await self.redis_client.smembers(set_key)
+            logger.debug(f"SMEMBERS (async) on {set_key}: Found={len(members)}")
+            return members
+        # --- CORRECCIÓN: Usar excepciones importadas ---
+        except (RedisConnectionError, RedisTimeoutError, asyncio.TimeoutError) as e:
+             logger.error(f"Connection/Timeout error on SMEMBERS (async) for {set_key}: {e}. Will attempt reconnect.")
+             await self.close_connection()
+             return None
+        except Exception as e:
+            logger.error(f"Unexpected error on SMEMBERS (async) for {set_key}: {e}", exc_info=True)
+            return None
+
+    async def ping(self) -> bool:
+         """Performs a PING command ASYNCHRONOUSLY. Returns True if successful, False otherwise."""
+         if not self.redis_client:
+             logger.warning("Ping check failed: Redis client is None.")
+             return False
+         try:
+             result = await asyncio.wait_for(self.redis_client.ping(), timeout=self._socket_timeout)
+             return result
+         # --- CORRECCIÓN: Usar excepciones importadas ---
+         except (RedisConnectionError, RedisTimeoutError, asyncio.TimeoutError) as e:
+             logger.warning(f"Ping failed during health check (async): {e}")
+             await self.close_connection()
+             return False
+         except Exception as e:
+             logger.error(f"Unexpected error during ping (async): {e}", exc_info=True)
+             await self.close_connection()
+             return False
+
+    async def close_connection(self):
+        """Closes the Redis connection if it's open. ASYNCHRONOUS."""
+        client = self.redis_client
+        if client:
+            self.redis_client = None
+            try:
+                await client.close()
+                # await client.connection_pool.disconnect()
+                logger.info("Async Redis connection closed.")
+            except Exception as e:
+                logger.error(f"Error closing async Redis connection: {e}", exc_info=True)
+
+
+# --- Example Usage (necesita adaptarse para asyncio o eliminarse) ---
+# El bloque if __name__ == "__main__" original necesitaría usar asyncio.run()
+# y convertir las llamadas a los métodos del manager a `await`.
+# Ejemplo de cómo se podría adaptar:
+async def main_async_example():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
-
-    # 1. Load configuration
     try:
         config = ConfigurationLoader()
     except ValueError as e:
         logger.error(f"Error loading configuration: {e}")
-        exit(1)
+        return # Salir si la config falla
 
-
-    # 2. Create manager instance
     redis_manager = RedisManager(config)
 
-    # 3. Connect and load script (important to do before using commands)
-    # The _ensure_connection method is now called internally by other methods,
-    # but we can call it once at the start to check the initial connection if desired.
-    logger.info("Checking initial Redis connection...")
-    if redis_manager._ensure_connection():
-        logger.info("Initial connection verified (or established) and script loaded.")
+    logger.info("Checking initial Redis connection (async example)...")
+    if await redis_manager._ensure_connection():
+        logger.info("Initial connection verified (async example).")
 
-        # 4. Example usage of wrapper methods
-        logger.info("\n--- Testing SADD/SMEMBERS ---")
-        redis_manager.sadd("managed_topics", "topic1")
-        redis_manager.sadd("managed_topics", "topic2")
-        topics = redis_manager.smembers("managed_topics")
-        print(f"Managed topics: {topics}")
+        logger.info("\n--- Testing SADD/SMEMBERS (async example) ---")
+        await redis_manager.sadd("managed_topics_async_test", "topicA")
+        await redis_manager.sadd("managed_topics_async_test", "topicB")
+        topics = await redis_manager.smembers("managed_topics_async_test")
+        print(f"Managed topics (async example): {topics}")
 
-        logger.info("\n--- Testing XGROUP CREATE ---")
-        stream_key_p0 = "stream:topic1:0"
-        redis_manager.xgroup_create(stream_key_p0, "groupA", mkstream=True)
-        redis_manager.xgroup_create(stream_key_p0, "groupA") # Try again
+        # ... adaptar el resto de las pruebas con await ...
 
-        logger.info("\n--- Testing XADD ---")
-        message_id = redis_manager.xadd(stream_key_p0, {"message": "hello partition 0"})
-        print(f"Message added to {stream_key_p0}: ID={message_id}")
-
-        logger.info("\n--- Testing Lua Script ---")
-        assignments_key = "assignments:topic1:groupA"
-        consumer1_id = "consumer-1"
-        num_parts = config.num_partitions
-
-        # Simulate heartbeat for consumer1
-        # We need direct client access for this in the example,
-        # which isn't ideal but serves for demonstration.
-        # In the real app, the heartbeat would be done by the consumer worker.
-        if redis_manager.redis_client:
+        # Simular heartbeat (necesitaría await si se usa redis_manager para 'set')
+        consumer1_id = "consumer-async-1"
+        if redis_manager.redis_client: # Aún necesitamos acceso directo para 'set' si no hay wrapper async
              try:
-                 redis_manager.redis_client.set(f"{config.heartbeat_key_prefix}{consumer1_id}", "alive", ex=config.heartbeat_ttl_seconds)
-                 logger.info(f"Simulated heartbeat for {consumer1_id}")
+                 # Idealmente, tendríamos un wrapper async `set_with_ttl` en RedisManager
+                 # Por ahora, usamos el cliente directamente (que es async)
+                 await redis_manager.redis_client.set(
+                     f"{config.heartbeat_key_prefix}{consumer1_id}",
+                     "alive",
+                     ex=config.heartbeat_ttl_seconds
+                 )
+                 logger.info(f"Simulated heartbeat for {consumer1_id} (async)")
              except Exception as e:
-                 logger.error(f"Error simulating heartbeat for {consumer1_id}: {e}")
-        else:
-             logger.warning("Cannot simulate heartbeat, client not connected.")
+                 logger.error(f"Error simulating heartbeat for {consumer1_id} (async): {e}")
 
 
-        print(f"\nAttempting to assign partition for {consumer1_id}...")
-        partition1 = redis_manager.execute_assignment_script(assignments_key, consumer1_id, num_parts)
+        logger.info("\n--- Testing Lua Script (async example) ---")
+        assignments_key = "assignments:topicA:groupAsync"
+        num_parts = config.num_partitions
+        partition1 = await redis_manager.execute_assignment_script(assignments_key, consumer1_id, num_parts)
         print(f"Partition assigned to {consumer1_id}: {partition1}")
 
-        print(f"\nAttempting to assign partition again for {consumer1_id}...")
-        partition1_again = redis_manager.execute_assignment_script(assignments_key, consumer1_id, num_parts)
-        print(f"Partition re-assigned to {consumer1_id}: {partition1_again}")
-
-        consumer2_id = "consumer-2"
-        print(f"\nAttempting to assign partition for {consumer2_id}...")
-        # Simulate heartbeat for consumer2
-        if redis_manager.redis_client:
-            try:
-                redis_manager.redis_client.set(f"{config.heartbeat_key_prefix}{consumer2_id}", "alive", ex=config.heartbeat_ttl_seconds)
-                logger.info(f"Simulated heartbeat for {consumer2_id}")
-            except Exception as e:
-                 logger.error(f"Error simulating heartbeat for {consumer2_id}: {e}")
-        else:
-             logger.warning("Cannot simulate heartbeat, client not connected.")
-
-        partition2 = redis_manager.execute_assignment_script(assignments_key, consumer2_id, num_parts)
-        print(f"Partition assigned to {consumer2_id}: {partition2}")
-
-
-        # 5. Close connection at the end
-        redis_manager.close_connection()
+        # Cerrar conexión al final
+        await redis_manager.close_connection()
     else:
-        logger.error("Could not establish initial Redis connection. Terminating.")
+        logger.error("Could not establish initial Redis connection (async example). Terminating.")
 
+
+if __name__ == "__main__":
+    # Ejecutar el ejemplo asíncrono
+    # Comenta o elimina esto si no necesitas correr el ejemplo directamente
+    print("Running RedisManager async example...")
+    try:
+        asyncio.run(main_async_example())
+    except KeyboardInterrupt:
+        print("Async example interrupted.")
+    print("RedisManager async example finished.")

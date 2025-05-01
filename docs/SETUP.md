@@ -112,3 +112,13 @@ python -m unittest discover -v
 
 # O ejecutar los tests de un archivo específico (ejemplo):
 # python -m unittest tests.test_config -v
+
+```
+
+## 6. Ejecución del Cliente
+
+Para verificar que el cliente se conecta correctamente al broker:
+
+```bash
+export QTASK_BROKER_URL="http://127.0.0.1:3000"
+python examples/basic.py
